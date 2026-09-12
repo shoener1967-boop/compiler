@@ -1,0 +1,9 @@
+Package: com.shosh.detectionmonitor
+Name: Detection Monitor
+Version: 0.1.0
+Architecture: iphoneos-arm64
+Description: Diagnostic monitor for jailbreak-detection API observations
+Maintainer: local
+Author: local
+Section: Utilities
+Depends: firmware (>= 16.0), ellekit
