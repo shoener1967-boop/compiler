@@ -1,102 +1,258 @@
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
 #import <errno.h>
-#import <fcntl.h>
-#import <libgen.h>
-#import <stdarg.h>
 #import <stdio.h>
-#import <string.h>
 #import <sys/stat.h>
-#import <sys/sysctl.h>
 #import <unistd.h>
 
+static __thread BOOL dmIsLogging = NO;
+
 static NSString *DMBundle(void) {
-    return NSBundle.mainBundle.bundleIdentifier ?: @"unknown";
+    NSString *bundleID = NSBundle.mainBundle.bundleIdentifier;
+    return bundleID.length > 0 ? bundleID : @"unknown";
 }
 
 static NSDictionary *DMPreferences(void) {
-    NSDictionary *d = [[NSUserDefaults standardUserDefaults] persistentDomainForName:@"com.shosh.detectionmonitor"];
-    return d ?: @{};
+    NSDictionary *preferences =
+        [[NSUserDefaults standardUserDefaults]
+            persistentDomainForName:@"com.shosh.detectionmonitor"];
+
+    return preferences ?: @{};
 }
 
 static BOOL DMEnabled(void) {
-    NSNumber *n = DMPreferences()[@"Enabled"];
-    return n ? n.boolValue : YES;
+    NSNumber *enabled = DMPreferences()[@"Enabled"];
+    return enabled ? enabled.boolValue : YES;
 }
 
 static BOOL DMTargetMatches(void) {
     NSString *target = DMPreferences()[@"TargetBundle"];
+
+    // Leeres Target bedeutet: alle injizierten Apps überwachen.
     return target.length == 0 || [target isEqualToString:DMBundle()];
 }
 
+static NSString *DMStringFromCString(const char *value) {
+    if (value == NULL) {
+        return @"(null)";
+    }
+
+    NSString *result = [NSString stringWithUTF8String:value];
+    return result ?: @"(invalid-utf8)";
+}
+
 static BOOL DMSuspicious(NSString *value) {
-    if (value.length == 0) return NO;
-    static NSArray *needles;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        needles = @[@"/var/jb", @"/var/binpack", @"/var/mobile/Library/Preferences", @"/Applications/Cydia.app", @"/Applications/Sileo.app", @"/Applications/Zebra.app", @"/usr/lib/substrate", @"/Library/MobileSubstrate", @"/bootstrap", @"/palera1n", @"/dopamine", @"/ellekit", @"frida", @"ssh"]; 
+    if (value.length == 0) {
+        return NO;
+    }
+
+    static NSArray<NSString *> *needles;
+    static dispatch_once_t onceToken;
+
+    dispatch_once(&onceToken, ^{
+        needles = @[
+            @"/var/jb",
+            @"/var/binpack",
+            @"/var/mobile/library/preferences",
+            @"/applications/cydia.app",
+            @"/applications/sileo.app",
+            @"/applications/zebra.app",
+            @"/usr/lib/substrate",
+            @"/library/mobilesubstrate",
+            @"/bootstrap",
+            @"/palera1n",
+            @"/dopamine",
+            @"/ellekit",
+            @"frida",
+            @"ssh"
+        ];
     });
-    NSString *lower = value.lowercaseString;
-    for (NSString *needle in needles) if ([lower containsString:needle.lowercaseString]) return YES;
+
+    NSString *lowercaseValue = value.lowercaseString;
+
+    for (NSString *needle in needles) {
+        if ([lowercaseValue containsString:needle]) {
+            return YES;
+        }
+    }
+
     return NO;
 }
 
-static void DMWrite(NSString *api, NSString *argument, NSString *result, int savedErrno) {
-    if (!DMEnabled() || !DMTargetMatches()) return;
-    NSDictionary *p = DMPreferences();
-    BOOL all = [p[@"LogAllPaths"] boolValue];
-    if (!all && !DMSuspicious(argument)) return;
+static void DMWrite(
+    NSString *api,
+    NSString *argument,
+    NSString *result,
+    int savedErrno
+) {
+    if (dmIsLogging) {
+        return;
+    }
 
-    NSString *dir = @"/var/mobile/Library/Logs/DetectionMonitor";
-    NSFileManager *fm = NSFileManager.defaultManager;
-    [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    NSString *path = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.log", DMBundle()]];
-    NSDateFormatter *f = [NSDateFormatter new];
-    f.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS";
-    NSString *line = [NSString stringWithFormat:@"[%@] bundle=%@ api=%@ arg=%@ result=%@ errno=%d suspicious=%@\n", f.stringFromDate:NSDate.date, DMBundle(), api, argument ?: @"", result ?: @"", savedErrno, DMSuspicious(argument) ? @"YES" : @"NO"];
-    NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:path];
-    if (!h) { [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]; return; }
-    [h seekToEndOfFile]; [h writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [h closeFile];
+    if (!DMEnabled() || !DMTargetMatches()) {
+        return;
+    }
+
+    NSDictionary *preferences = DMPreferences();
+    BOOL logAllPaths = [preferences[@"LogAllPaths"] boolValue];
+
+    if (!logAllPaths && !DMSuspicious(argument)) {
+        return;
+    }
+
+    dmIsLogging = YES;
+
+    @autoreleasepool {
+        NSString *directory =
+            @"/var/mobile/Library/Logs/DetectionMonitor";
+
+        NSFileManager *fileManager = [NSFileManager defaultManager];
+
+        [fileManager createDirectoryAtPath:directory
+               withIntermediateDirectories:YES
+                                attributes:nil
+                                     error:nil];
+
+        NSString *filename =
+            [NSString stringWithFormat:@"%@.log", DMBundle()];
+
+        NSString *logPath =
+            [directory stringByAppendingPathComponent:filename];
+
+        NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+        formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS";
+
+        NSString *timestamp =
+            [formatter stringFromDate:[NSDate date]];
+
+        NSString *line =
+            [NSString stringWithFormat:
+                @"[%@] bundle=%@ api=%@ arg=%@ result=%@ errno=%d suspicious=%@\n",
+                timestamp,
+                DMBundle(),
+                api ?: @"unknown",
+                argument ?: @"",
+                result ?: @"",
+                savedErrno,
+                DMSuspicious(argument) ? @"YES" : @"NO"];
+
+        NSFileHandle *handle =
+            [NSFileHandle fileHandleForWritingAtPath:logPath];
+
+        if (handle == nil) {
+            [line writeToFile:logPath
+                   atomically:YES
+                     encoding:NSUTF8StringEncoding
+                        error:nil];
+        } else {
+            [handle seekToEndOfFile];
+
+            NSData *data =
+                [line dataUsingEncoding:NSUTF8StringEncoding];
+
+            [handle writeData:data];
+            [handle closeFile];
+        }
+    }
+
+    dmIsLogging = NO;
 }
 
 %hookf(int, access, const char *path, int mode) {
-    int r = %orig(path, mode); int e = errno;
-    DMWrite(@"access", path ? @(path) : @"(null)", [NSString stringWithFormat:@"%d", r], e);
-    return r;
+    int result = %orig(path, mode);
+    int savedErrno = errno;
+
+    DMWrite(
+        @"access",
+        DMStringFromCString(path),
+        [NSString stringWithFormat:@"%d", result],
+        savedErrno
+    );
+
+    errno = savedErrno;
+    return result;
 }
 
-%hookf(int, stat, const char *path, struct stat *sb) {
-    int r = %orig(path, sb); int e = errno;
-    DMWrite(@"stat", path ? @(path) : @"(null)", [NSString stringWithFormat:@"%d", r], e);
-    return r;
+%hookf(int, stat, const char *path, struct stat *buffer) {
+    int result = %orig(path, buffer);
+    int savedErrno = errno;
+
+    DMWrite(
+        @"stat",
+        DMStringFromCString(path),
+        [NSString stringWithFormat:@"%d", result],
+        savedErrno
+    );
+
+    errno = savedErrno;
+    return result;
 }
 
-%hookf(int, lstat, const char *path, struct stat *sb) {
-    int r = %orig(path, sb); int e = errno;
-    DMWrite(@"lstat", path ? @(path) : @"(null)", [NSString stringWithFormat:@"%d", r], e);
-    return r;
+%hookf(int, lstat, const char *path, struct stat *buffer) {
+    int result = %orig(path, buffer);
+    int savedErrno = errno;
+
+    DMWrite(
+        @"lstat",
+        DMStringFromCString(path),
+        [NSString stringWithFormat:@"%d", result],
+        savedErrno
+    );
+
+    errno = savedErrno;
+    return result;
 }
 
 %hookf(FILE *, fopen, const char *path, const char *mode) {
-    FILE *r = %orig(path, mode); int e = errno;
-    DMWrite(@"fopen", path ? @(path) : @"(null)", r ? @"non-null" : @"NULL", e);
-    return r;
+    FILE *result = %orig(path, mode);
+    int savedErrno = errno;
+
+    DMWrite(
+        @"fopen",
+        DMStringFromCString(path),
+        result != NULL ? @"non-null" : @"NULL",
+        savedErrno
+    );
+
+    errno = savedErrno;
+    return result;
 }
 
 %hookf(void *, dlopen, const char *path, int mode) {
-    void *r = %orig(path, mode); int e = errno;
-    DMWrite(@"dlopen", path ? @(path) : @"(null)", r ? @"non-null" : @"NULL", e);
-    return r;
+    void *result = %orig(path, mode);
+    int savedErrno = errno;
+
+    DMWrite(
+        @"dlopen",
+        DMStringFromCString(path),
+        result != NULL ? @"non-null" : @"NULL",
+        savedErrno
+    );
+
+    errno = savedErrno;
+    return result;
 }
 
 %hookf(pid_t, fork) {
-    pid_t r = %orig; int e = errno;
-    DMWrite(@"fork", @"(no argument)", [NSString stringWithFormat:@"%d", r], e);
-    return r;
+    pid_t result = %orig;
+    int savedErrno = errno;
+
+    DMWrite(
+        @"fork",
+        @"(no argument)",
+        [NSString stringWithFormat:@"%d", result],
+        savedErrno
+    );
+
+    errno = savedErrno;
+    return result;
 }
 
 %ctor {
     @autoreleasepool {
-        NSLog(@"[DetectionMonitor] loaded for %@", DMBundle());
+        NSLog(
+            @"[DetectionMonitor] loaded for %@",
+            DMBundle()
+        );
     }
 }
